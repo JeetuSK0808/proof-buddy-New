@@ -5,7 +5,11 @@ from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from dill import dumps, loads
 from django.core.cache import cache
-from .models import InductionProof, InductionProofLine
+from django.db import models
+from django.contrib.contenttypes.models import ContentType
+import traceback
+from assignments.models import StudentProofMapping
+from .models import InductionProof, InductionProofLine, InductionProofLineComment
 from .serializers import InductionProofSerializer, InductionProofCreateSerializer
 import re
 
@@ -1008,18 +1012,17 @@ def _get_case_side(proof: IndProof, case: str, side: str) -> ERProof:
     return ts.LHS if side_key == "LHS" else ts.RHS
 
 
-def _apply_line(target: ERProof, currentRacket: str, rule: str | None, startPosition: int | None, substitution: str | None):
+def _apply_line(target: ERProof, currentRacket: str, rule: str | None, startPosition: int | None, substitution: str | None, auto_infer: bool = False, support_rewrite_complexity = True):
     if rule:
         # Apply rule directly - don't duplicate first
         # The rule application will create a new line based on currentRacket
         if substitution is not None and substitution != "":
-            target.addProofLine(currentRacket, rule, int(startPosition or 0), substitution)
+            target.addProofLine(currentRacket, rule, int(startPosition or 0), substitution, support_rewrite_complexity=support_rewrite_complexity)
         else:
-            target.addProofLine(currentRacket, rule, int(startPosition or 0))
+            target.addProofLine(currentRacket, rule, int(startPosition or 0), auto_infer=auto_infer)
     else:
         # goal/premise line only
         target.addProofLine(currentRacket)
-
 
 @api_view(["POST"]) 
 @permission_classes([IsAuthenticated])
@@ -1044,6 +1047,7 @@ def apply_rule(request):
         selectedNode = data.get("selectedNode")
         substitution = data.get("substitution")
         lineNumber = data.get("lineNumber")
+        support_rewrite_complexity = data.get("supportRewriteComplexity", True)
 
         # Guard: "rewrite math" must use the Substitution button, not the rule field
         rewrite_math_error = _check_rewrite_math_misuse(rule)
@@ -1163,8 +1167,17 @@ def apply_rule(request):
                                     target.ruleSet['apply'][_lemma_name] = _lemma_rule
                                     _lemma_injected = True
 
+        # Read support_value_mapping from DB (HIGH support = auto-infer params)
+        _auto_infer = False
+        if proof_id:
+            try:
+                _db_ind_proof = InductionProof.objects.get(id=proof_id)
+                _auto_infer = bool(_db_ind_proof.support_value_mapping)
+            except InductionProof.DoesNotExist:
+                pass
+
         if not target.errLog:
-            _apply_line(target, currentRacket, rule, startPosition, substitution)
+            _apply_line(target, currentRacket, rule, startPosition, substitution, auto_infer=_auto_infer, support_rewrite_complexity=support_rewrite_complexity)
 
         # Remove temporarily injected lemma rule
         if _lemma_injected and _lemma_name and _lemma_name in target.ruleSet.get('apply', {}):
@@ -1188,6 +1201,7 @@ def apply_rule(request):
         # Save to cache
         save_induction_obj_to_cache(user, proof, proof_id)
         
+        rule_with_sub = None  # will hold appliedRule (with ↦ annotations) if a line was generated
         # Save to database if we have a valid proof line
         if len(target.proofLines) > 0:
             last_line = target.proofLines[-1]
@@ -1256,13 +1270,13 @@ def apply_rule(request):
             "errors": target.errLog,
             "jsonTree": jsonTree,
             "lineNum": max(0, len(target.proofLines) - 1),
-            "resultNodeId": result_node_id
+            "resultNodeId": result_node_id,
+            "rule": rule_with_sub
         }, status=status.HTTP_200_OK)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return Response({"isValid": False, "errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST)
-
 
 @api_view(["DELETE"]) 
 def delete_line(request, case, side, line_number):
@@ -1566,22 +1580,49 @@ def check_completion(request):
         reload_proof_lines_from_db(proof, proof_id)
         
         case = data.get("case", "base")
+        is_student = not user.is_instructor
         
         if case == 'base':
-            is_complete = proof.baseCase.checkComplete()
+            is_complete = proof.baseCase.checkComplete(is_student)
             label = "BASE CASE"
         elif case == 'leap':
-            is_complete = proof.leapStep.checkComplete()
+            is_complete = proof.leapStep.checkComplete(is_student)
             label = "LEAP STEP"
         else:
             return Response({"error": "Invalid case. Use 'base' or 'leap'."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Check overall completion and update indProof.isComplete
-        overall_complete = proof.checkComplete()
+        is_mathematically_complete = proof.checkComplete(user.is_instructor)
 
+        # Check if there are any hidden fields remaining
+        has_hidden_fields = False
+        if not user.is_instructor and proof_id:
+            has_hidden_fields = InductionProofLine.objects.filter(
+                proof_id=proof_id, case=case
+            ).filter(
+                models.Q(hide_expression=True) | models.Q(hide_justification=True)
+            ).exists()
+        
+        # Proof is only complete if mathematically correct AND no hidden fields
+        overall_complete = is_mathematically_complete and not has_hidden_fields
         # Persist overall completion status to database
         if proof_id:
             InductionProof.objects.filter(id=proof_id).update(is_complete=overall_complete)
+
+            # update assignment if it exists and is completed for the first time
+            if overall_complete:
+                content_type = ContentType.objects.get(app_label="induction_api", model="inductionproof")
+                mapping = StudentProofMapping.objects.filter(
+                    content_type=content_type,
+                    object_id=proof_id
+                ).first()
+
+                # If it belongs to an assignment, lock in the completion timestamp
+                if mapping:
+                    # Only set it if it hasn't been completed before
+                    if not mapping.completed_at:
+                        mapping.completed_at = timezone.now()
+                        mapping.save()
 
         # Save updated completion status to cache
         save_induction_obj_to_cache(user, proof, proof_id)
@@ -1592,8 +1633,8 @@ def check_completion(request):
             "overallComplete": overall_complete
         }, status=status.HTTP_200_OK)
     except Exception as e:
+        traceback.print_exc()
         return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
 
 @api_view(["GET"])
 def get_proof_lines(request):
@@ -2240,17 +2281,37 @@ def update_comment(request):
     user = request.user
 
     cached = cache.get(f"induction_obj_{user.username}")
-    if not cached:
+    proof_id = cached.get('proof_id') if cached else None
+
+    # Fall back to the proofId sent by the client when the server-side cache
+    # has no active proof (the cache entry can be culled or expire, and is
+    # lost on restart; the client's sessionStorage copy survives all three).
+    if not proof_id:
+        proof_id = request.data.get('proofId')
+
+    if not proof_id:
         return Response(
-            {"error": "No active proof session. Please open a proof first."},
+            {"error": "No active proof session. Please save or open a proof first."},
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    proof_id = cached.get('proof_id')
-    if not proof_id:
+    try:
+        proof_id = int(proof_id)
+    except (TypeError, ValueError):
         return Response(
-            {"error": "Proof ID missing from session."},
+            {"error": "Invalid proofId."},
             status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Ownership: students may only comment on their own proofs; instructors
+    # may comment on any proof (reviewing student work).
+    target_proof = InductionProof.objects.filter(id=proof_id).first()
+    if target_proof is None:
+        return Response({"error": "Proof not found."}, status=status.HTTP_404_NOT_FOUND)
+    if not getattr(user, 'is_instructor', False) and target_proof.user_id != user.id:
+        return Response(
+            {"error": "You do not have access to this proof."},
+            status=status.HTTP_403_FORBIDDEN
         )
 
     case = request.data.get('case', '').lower()
@@ -2311,3 +2372,594 @@ def update_comment(request):
         "studentComment": line.student_comment,
         "commentCorrect": line.comment_correct,
     }, status=status.HTTP_200_OK)
+
+# ======================================================================
+# Endpoints restored from the pre-port induction API surface.
+# The comment-feature port removed them, which broke the existing
+# induction test-suite (404s) and the CommentsModal save/get calls.
+# ======================================================================
+
+def normalize_whitespace(text):
+    """Remove all whitespace for comparison"""
+    return re.sub(r'\s+', ' ', text.strip())
+
+
+@api_view(["POST"]) 
+def set_current_proof(request):
+    """
+    Initialize a full IndProof engine instance using frontend inputs.
+    Expected JSON:
+    {
+      "struct": "int" | "list",
+      "ivar": "n",
+      "aval": "0",            # anchor value expression
+      "lvar": "k",            # leap variable
+      "lhsPremise": "(sum n)",
+      "rhsPremise": "(* n (+ n 1) (/ 1 2))",
+      "definitions": [ { "label": "(f n)", "type": "int -> int", "expression": "..." }, ... ]
+    }
+    Returns 201 with initial state (json trees for base case LHS/RHS and leap step premises).
+    """
+    user = request.user
+    data = request.data
+    try:
+        struct = str(data.get("struct", "int")).lower()
+        ivar = data.get("ivar")
+        aval = data.get("aval")
+        lvar = data.get("lvar")
+        lhsPremise = data.get("lhsPremise")
+        rhsPremise = data.get("rhsPremise")
+        definitions_and_generics = data.get("definitions", [])
+        definitions = []
+        generics = data.get("generics", [])
+        
+        for item in definitions_and_generics:
+            if item.get('is_generic'):
+                generics.append(item)
+            else:
+                item['applied'] = True
+                definitions.append(item)
+
+        # Basic validation
+        missing = [k for k in ("ivar","aval","lvar","lhsPremise","rhsPremise") if not data.get(k)]
+        if missing:
+            return Response({"isValid": False, "errors": [f"Missing fields: {', '.join(missing)}"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create a fresh IndProof engine, but preserve existing proof_id if available
+        _, existing_proof_id = get_or_set_induction_obj(user)
+        ind = IndProof()
+        ind.struct = struct
+        ind.ivar = ivar
+        ind.aval = aval
+        ind.lvar = lvar
+        ind.lhsPremise = lhsPremise
+        ind.rhsPremise = rhsPremise
+
+        # Add generics to both baseCase and leapStep
+        errors = []
+        for g in generics:
+            try:
+                use_uploaded_generic(user, ind.baseCase, g)
+                use_uploaded_generic(user, ind.leapStep, g)
+            except Exception as e:
+                error_msg = f"Error adding generic {g.get('label')}: {str(e)}"
+                errors.append(error_msg)
+        
+        if errors:
+            return Response({
+                "isValid": False,
+                "errors": errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Add user definitions (UDF) to both baseCase and leapStep rule sets
+        for d in definitions:
+            label = d.get("label")
+            type_str = d.get("type")
+            body = d.get("expression")
+            if not label or not type_str or body is None:
+                continue
+            ind.baseCase.addUDF(label, type_str, body)
+            ind.leapStep.addUDF(label, type_str, body)
+            # track definition list similar to racket_api
+            if getattr(ind, "definitions", None) is None:
+                ind.definitions = []
+            ind.definitions.append({
+                "label": label,
+                "type": type_str,
+                "expression": body,
+                "applied": True
+            })
+
+        # Build base case premises (ivar -> aval) and add as first proof lines
+        # LHS
+        lhs_line = ERProofLine(lhsPremise, ind.baseCase.LHS.debug, ind.baseCase.LHS.ruleSet, generics=ind.baseCase.LHS.generics)
+        aval_line = ERProofLine(aval, ind.baseCase.LHS.debug, ind.baseCase.LHS.ruleSet, generics=ind.baseCase.LHS.generics)
+        if lhs_line.errLog:
+            return Response({"isValid": False, "errors": lhs_line.errLog}, status=status.HTTP_400_BAD_REQUEST)
+        if aval_line.errLog:
+            return Response({"isValid": False, "errors": aval_line.errLog}, status=status.HTTP_400_BAD_REQUEST)
+        recursiveReplaceNodes(lhs_line.exprTree, [ivar], [aval_line.exprTree])
+        ind.baseCase.LHS.addProofLine(str(lhs_line.exprTree))
+
+        # RHS
+        rhs_line = ERProofLine(rhsPremise, ind.baseCase.RHS.debug, ind.baseCase.RHS.ruleSet, generics=ind.baseCase.RHS.generics)
+        aval_line_rhs = ERProofLine(aval, ind.baseCase.RHS.debug, ind.baseCase.RHS.ruleSet, generics=ind.baseCase.RHS.generics)
+        if rhs_line.errLog:
+            return Response({"isValid": False, "errors": rhs_line.errLog}, status=status.HTTP_400_BAD_REQUEST)
+        if aval_line_rhs.errLog:
+            return Response({"isValid": False, "errors": aval_line_rhs.errLog}, status=status.HTTP_400_BAD_REQUEST)
+        recursiveReplaceNodes(rhs_line.exprTree, [ivar], [aval_line_rhs.exprTree])
+        ind.baseCase.RHS.addProofLine(str(rhs_line.exprTree))
+
+        # Build induction hypothesis nodes (ivar -> lvar) and register IH rule
+        ih_lhs_line = ERProofLine(lhsPremise, ind.baseCase.LHS.debug, ind.baseCase.LHS.ruleSet, generics=ind.baseCase.LHS.generics)
+        ih_rhs_line = ERProofLine(rhsPremise, ind.baseCase.RHS.debug, ind.baseCase.RHS.ruleSet, generics=ind.baseCase.RHS.generics)
+        lvar_line = ERProofLine(lvar, ind.baseCase.LHS.debug, ind.baseCase.LHS.ruleSet, generics=ind.baseCase.LHS.generics)
+        lvar_line_rhs = ERProofLine(lvar, ind.baseCase.RHS.debug, ind.baseCase.RHS.ruleSet, generics=ind.baseCase.RHS.generics)
+        if ih_lhs_line.errLog or ih_rhs_line.errLog or lvar_line.errLog or lvar_line_rhs.errLog:
+            errors = []
+            errors.extend(ih_lhs_line.errLog or [])
+            errors.extend(ih_rhs_line.errLog or [])
+            errors.extend(lvar_line.errLog or [])
+            errors.extend(lvar_line_rhs.errLog or [])
+            return Response({"isValid": False, "errors": errors}, status=status.HTTP_400_BAD_REQUEST)
+        recursiveReplaceNodes(ih_lhs_line.exprTree, [ivar], [lvar_line.exprTree])
+        recursiveReplaceNodes(ih_rhs_line.exprTree, [ivar], [lvar_line_rhs.exprTree])
+        ind.indHypLHS = ih_lhs_line.exprTree
+        ind.indHypRHS = ih_rhs_line.exprTree
+        ih_rule = IH(ind.indHypLHS, ind.indHypRHS)
+        ind.baseCase.ruleSet['apply']['IH'] = ih_rule
+        ind.leapStep.ruleSet['apply']['IH'] = ih_rule
+
+        # Prepare leap step: add generic for lvar, build premises with proper successor
+        try:
+            ind.leapStep.addGeneric(lvar, struct)
+        except Exception:
+            # ignore if invalid; frontend can still proceed applying IH/rules
+            pass
+
+        # Build leap successor expression based on structure
+        if struct == "int":
+            leap_succ_expr = f"(+ {lvar} 1)"
+        elif struct == "list":
+            # For list UP induction: (cons a K) where a is generic Any, K is lvar
+            # Note: We created generic 'a' in start_induction_proof
+            leap_succ_expr = f"(cons a {lvar})"
+        else:
+            leap_succ_expr = None
+            
+        if leap_succ_expr:
+            leap_succ_line_L = ERProofLine(leap_succ_expr, ind.leapStep.LHS.debug, ind.leapStep.LHS.ruleSet, generics=ind.leapStep.LHS.generics)
+            leap_succ_line_R = ERProofLine(leap_succ_expr, ind.leapStep.RHS.debug, ind.leapStep.RHS.ruleSet, generics=ind.leapStep.RHS.generics)
+            lhs_leap_line = ERProofLine(lhsPremise, ind.leapStep.LHS.debug, ind.leapStep.LHS.ruleSet, generics=ind.leapStep.LHS.generics)
+            rhs_leap_line = ERProofLine(rhsPremise, ind.leapStep.RHS.debug, ind.leapStep.RHS.ruleSet, generics=ind.leapStep.RHS.generics)
+            if not (lhs_leap_line.errLog or rhs_leap_line.errLog or leap_succ_line_L.errLog or leap_succ_line_R.errLog):
+                recursiveReplaceNodes(lhs_leap_line.exprTree, [ivar], [leap_succ_line_L.exprTree])
+                recursiveReplaceNodes(rhs_leap_line.exprTree, [ivar], [leap_succ_line_R.exprTree])
+                ind.leapStep.LHS.addProofLine(str(lhs_leap_line.exprTree))
+                ind.leapStep.RHS.addProofLine(str(rhs_leap_line.exprTree))
+
+        # Save engine to cache, preserving proof_id that was set by start_induction_proof
+        save_induction_obj_to_cache(user, ind, existing_proof_id)
+
+        # Persist user-supplied generics to proof.definition so session restore finds them
+        if existing_proof_id and generics:
+            try:
+                db_proof = InductionProof.objects.get(id=existing_proof_id)
+                existing_defs = list(db_proof.definition or [])
+                existing_labels = {d.get('label') or d.get('name') for d in existing_defs}
+                for g in generics:
+                    glabel = g.get('label') or g.get('name')
+                    if glabel and glabel not in existing_labels:
+                        existing_defs.append({
+                            'name': glabel,
+                            'label': glabel,
+                            'type': g.get('type', 'Any'),
+                            'body': '<generic>',
+                            'is_generic': True,
+                            'description': f'User generic {glabel}',
+                            'restrictions': g.get('restrictions') or {}
+                        })
+                db_proof.definition = existing_defs
+                db_proof.save()
+            except InductionProof.DoesNotExist:
+                pass
+
+        # Now save the properly initialized premises to database
+        if existing_proof_id:
+            # Save base case premises (these have ivar substituted with aval)
+            if ind.baseCase.LHS.proofLines:
+                save_proof_line_to_db(
+                    proof_id=existing_proof_id,
+                    case='base',
+                    side='LHS',
+                    racket=str(ind.baseCase.LHS.proofLines[0].exprTree),
+                    rule='Premise',
+                    start_position=0,
+                    line_number=0,
+                    selected_node=0,
+                    json_tree=makeJson(ind.baseCase.LHS.proofLines[0].exprTree),
+                    errors=ind.baseCase.LHS.proofLines[0].errors
+                )
+            if ind.baseCase.RHS.proofLines:
+                save_proof_line_to_db(
+                    proof_id=existing_proof_id,
+                    case='base',
+                    side='RHS',
+                    racket=str(ind.baseCase.RHS.proofLines[0].exprTree),
+                    rule='Premise',
+                    start_position=0,
+                    line_number=0,
+                    selected_node=0,
+                    json_tree=makeJson(ind.baseCase.RHS.proofLines[0].exprTree),
+                    errors=ind.baseCase.RHS.proofLines[0].errors
+                )
+            # Save leap step premises (these have ivar substituted with (+ lvar 1))
+            if ind.leapStep.LHS.proofLines:
+                save_proof_line_to_db(
+                    proof_id=existing_proof_id,
+                    case='leap',
+                    side='LHS',
+                    racket=str(ind.leapStep.LHS.proofLines[0].exprTree),
+                    rule='Premise',
+                    start_position=0,
+                    line_number=0,
+                    selected_node=0,
+                    json_tree=makeJson(ind.leapStep.LHS.proofLines[0].exprTree),
+                    errors=ind.leapStep.LHS.proofLines[0].errors
+                )
+            if ind.leapStep.RHS.proofLines:
+                save_proof_line_to_db(
+                    proof_id=existing_proof_id,
+                    case='leap',
+                    side='RHS',
+                    racket=str(ind.leapStep.RHS.proofLines[0].exprTree),
+                    rule='Premise',
+                    start_position=0,
+                    line_number=0,
+                    selected_node=0,
+                    json_tree=makeJson(ind.leapStep.RHS.proofLines[0].exprTree),
+                    errors=ind.leapStep.RHS.proofLines[0].errors
+                )
+
+        # Build frontend payload with jsonTrees for latest lines
+        payload = {
+            "isValid": True,
+            "errors": [],
+            "base": {
+                "LHS": {
+                    "racket": ind.baseCase.LHS.getPrevRacket(),
+                    "jsonTree": makeJson(ind.baseCase.LHS.proofLines[-1].exprTree),
+                },
+                "RHS": {
+                    "racket": ind.baseCase.RHS.getPrevRacket(),
+                    "jsonTree": makeJson(ind.baseCase.RHS.proofLines[-1].exprTree),
+                },
+            },
+            "leap": {
+                "LHS": {
+                    "racket": ind.leapStep.LHS.getPrevRacket() if len(ind.leapStep.LHS.proofLines) else "",
+                    "jsonTree": makeJson(ind.leapStep.LHS.proofLines[-1].exprTree) if len(ind.leapStep.LHS.proofLines) else {},
+                },
+                "RHS": {
+                    "racket": ind.leapStep.RHS.getPrevRacket() if len(ind.leapStep.RHS.proofLines) else "",
+                    "jsonTree": makeJson(ind.leapStep.RHS.proofLines[-1].exprTree) if len(ind.leapStep.RHS.proofLines) else {},
+                },
+            }
+        }
+        return Response(payload, status=status.HTTP_201_CREATED)
+    except Exception as e:
+        import traceback
+        print("Error in set_current_induction_proof:", str(e))
+        print(traceback.format_exc())
+        return Response({"isValid": False, "errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["POST"])
+def clear_induction(request):
+    """Clear cache of the current active proof for the user"""
+    from .models import InductionProof
+    user = request.user
+    
+    try:
+        # Find the active proof
+        proof = InductionProof.objects.filter(user=user, is_active=True).order_by('-created_at').first()
+        
+        if proof:
+            # Archive the proof in the database (soft delete)
+            proof.is_active = False
+            proof.save()
+            # Clear the cache
+            cache.delete(f"induction_obj_{user.username}")
+            
+            return Response({
+                "message": "Proof archived successfully",
+                "proof_name": proof.name or "Unnamed proof"
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                "message": "No active proof found"
+            }, status=status.HTTP_200_OK)
+    except Exception as e:
+        return Response({
+            "error": str(e)
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["GET"])
+def get_induction_proofs(request):
+    user = request.user
+    query = request.GET.get('query', '')
+    
+    # Filter proofs by user and optionally by query (name contains)
+    proofs = InductionProof.objects.filter(user=user, is_active=True)
+    if query:
+        proofs = proofs.filter(name__icontains=query)
+    
+    proofs = proofs.order_by('-created_at')
+    
+    serializer = InductionProofSerializer(proofs, many=True)
+    
+    # Return in the same format as equational reasoning for consistency
+    return Response({
+        "proofs": serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(["GET"])
+def get_comments(request):
+
+    try:
+        user = request.user
+        _, proof_id = get_or_set_induction_obj(user)
+
+        side = request.GET.get("side")
+        line_number = int(request.GET.get("line_number"))
+
+        comments = InductionProofLineComment.objects.filter(
+            proof_id=proof_id,
+            side=side,
+            line_number=line_number
+        )
+
+        result = {
+            "student": "",
+            "instructor": ""
+        }
+
+        for c in comments:
+
+            if c.role == "student":
+                result["student"] = c.comment
+
+            elif c.role == "instructor":
+                result["instructor"] = c.comment
+
+        return Response(result, status=status.HTTP_200_OK)
+
+    except Exception as e:
+
+        print("GET COMMENTS ERROR:", e)
+
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+
+@api_view(["POST"])
+def save_comment(request):
+    if request.method != "POST":
+        return Response(
+            {"error": "POST required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        user = request.user
+        _, proof_id = get_or_set_induction_obj(user)
+
+        data = request.data
+
+        side = data.get("side")
+        line_number = data.get("line_number")
+        role = data.get("role")
+        comment_text = data.get("comment")
+
+        if not all([side, line_number is not None, role]):
+            return Response(
+                {"error": "Missing required fields"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        comment_obj, created = InductionProofLineComment.objects.update_or_create(
+            proof_id=proof_id,
+            side=side,
+            line_number=line_number,
+            role=role,
+            defaults={
+                "comment": comment_text
+            }
+        )
+
+        return Response({
+            "success": True,
+            "created": created
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+
+
+@api_view(["DELETE"]) 
+def delete_line_by_path(request, case, side, line_number):
+    """Clear a proof line (blank out racket expression and rule) instead of deleting it"""
+    user = request.user
+    proof, proof_id = get_or_set_induction_obj(user)
+    
+    print(f"[DELETE_LINE] Called with case={case}, side={side}, line_number={line_number}")
+    
+    try:
+        # Mark proof incomplete when clearing
+        if case == 'base':
+            proof.baseCase.markIncomplete()
+        else:
+            proof.leapStep.markIncomplete()
+        proof.isComplete = False
+        
+        target = _get_case_side(proof, case, side)
+        print(f"[DELETE_LINE] Target has {len(target.proofLines)} proof lines")
+        
+        if line_number > 0 and len(target.proofLines) > line_number:
+            # Clear the line in memory by replacing it with an empty line
+            # Empty string is now allowed thanks to special case in ERProofLine.__init__
+            empty_line = ERProofLine("", target.debug, target.ruleSet, generics=target.generics)
+            target.proofLines[line_number] = empty_line
+            
+            # Clear in database - update the line to have empty racket and rule
+            if proof_id:
+                from .models import InductionProofLine
+                # Clear the current line (racket, rule, and all position markers)
+                # Normalize case to lowercase and side to uppercase to match database storage
+                
+                # Check if line exists before update
+                exists = InductionProofLine.objects.filter(
+                    proof_id=proof_id,
+                    case=case.lower(),
+                    side=side.upper(),
+                    line_number=line_number
+                ).exists()
+                
+                if exists:
+                    updated_count = InductionProofLine.objects.filter(
+                        proof_id=proof_id,
+                        case=case.lower(),
+                        side=side.upper(),
+                        line_number=line_number
+                    ).update(
+                        racket='',
+                        rule='',
+                        start_position=0,
+                        selected_node=0,
+                        result_node=0
+                    )
+                else:
+                    # Line not found, cannot clear
+                    pass
+                
+                # Also clear the rule on the next line (if it exists)
+                InductionProofLine.objects.filter(
+                    proof_id=proof_id,
+                    case=case.lower(),
+                    side=side.upper(),
+                    line_number=line_number + 1
+                ).update(rule='')
+                
+                # Clear selected_node (target highlight) on the previous line (if it exists)
+                if line_number > 0:
+                    InductionProofLine.objects.filter(
+                        proof_id=proof_id,
+                        case=case.lower(),
+                        side=side.upper(),
+                        line_number=line_number - 1
+                    ).update(selected_node=0)
+        
+        save_induction_obj_to_cache(user, proof, proof_id)
+        return Response(status=status.HTTP_200_OK)
+    except Exception as e:
+        print(f"Error in delete_line: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["POST"])
+def create_induction_proof(request):
+    user = request.user
+    
+    create_serializer = InductionProofCreateSerializer(data=request.data)
+    
+    if not create_serializer.is_valid():
+        return Response(
+            {
+                "error": "Validation failed",
+                "details": create_serializer.errors
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    validated_data = create_serializer.validated_data
+    
+    proof_data = {
+        'user': user.id,
+        'proof_type': 'induction_int',
+        'induction_variable': validated_data['induction_variable'],
+        'anchor_value': validated_data['anchor_value'],
+        'leap_variable': validated_data['leap_variable'],
+        'lhs_expression': validated_data['lhs_expression'],
+        'rhs_expression': validated_data['rhs_expression'],
+        'inductive_hypothesis_lhs' : validated_data.get('inductive_hypothesis_lhs', ''),
+        'inductive_hypothesis_rhs' : validated_data.get('inductive_hypothesis_rhs', ''),
+        'is_valid': True,
+        'definition': [],
+    }
+    
+    induction_var = validated_data['induction_variable']
+    leap_var = validated_data['leap_variable']
+    anchor_val = validated_data['anchor_value']
+    
+    lhs_anchor = validated_data['lhs_expression'].replace(
+        induction_var, str(anchor_val)
+    )
+    rhs_anchor = validated_data['rhs_expression'].replace(
+        induction_var, str(anchor_val)
+    )
+    
+    lhs_leap = validated_data['lhs_expression'].replace(
+        induction_var, leap_var
+    )
+    rhs_leap = validated_data['rhs_expression'].replace(
+        induction_var, leap_var
+    )
+    
+    proof_data.update({
+        'lhs_anchor_goal': lhs_anchor,
+        'rhs_anchor_goal': rhs_anchor,
+        'lhs_leap_goal': lhs_leap,
+        'rhs_leap_goal': rhs_leap,
+        'current_goal': 'base_case',
+    })
+    
+    serializer = InductionProofSerializer(data=proof_data)
+    
+    if serializer.is_valid():
+        proof = serializer.save(user=user)
+        
+        save_induction_proof_to_cache(user, {
+            'id': proof.id,
+            'lhs_leap_goal': proof.lhs_leap_goal,
+            'rhs_leap_goal': proof.rhs_leap_goal,
+            'lhs_anchor_goal': proof.lhs_anchor_goal,
+            'rhs_anchor_goal': proof.rhs_anchor_goal,
+            'current_goal': proof.current_goal,
+            'isValid': proof.is_valid,
+            'definition': proof.definition,
+        })
+        
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED
+        )
+    
+    return Response(
+        {
+            "error": "Failed to create proof",
+            "details": serializer.errors
+        },
+        status=status.HTTP_400_BAD_REQUEST
+    )
+

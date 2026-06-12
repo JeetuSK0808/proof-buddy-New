@@ -24,4 +24,13 @@ urlpatterns = [
     path("set-parameters", views.set_parameters, name="set_parameters"),
     path("download-proof", views.download_proof, name="download_proof"),
     path("upload-proof", views.upload_proof, name="upload_proof"),
+    # Restored pre-port endpoints (used by the induction test-suite and CommentsModal)
+    path("set-current-proof", views.set_current_proof, name="set_current_proof"),
+    path("clear-induction", views.clear_induction, name="clear_induction"),
+    path("get-induction-proofs/", views.get_induction_proofs, name="get_induction_proofs"),
+    path("delete-line/<str:case>/<str:side>/<int:line_number>", views.delete_line_by_path, name="delete_line_by_path"),
+    path("save-comment", views.save_comment, name="save_comment"),
+    path("get-comments", views.get_comments, name="get_comments"),
+    path("check-completion", views.check_completion, name="check_completion"),
+    path("create-induction-proof/", views.create_induction_proof, name="create_induction_proof"),
 ]
