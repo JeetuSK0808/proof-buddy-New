@@ -142,8 +142,10 @@ const ProofLineComment = ({
     } catch { /* ignore */ }
   };
 
-  const hasInstructorComment = !!(instructorComment && instructorComment.trim());
-  const hasStudentComment = !!(studentComment && studentComment.trim());
+  // Include the local post-save state so the flag icon updates immediately
+  // after a save instead of only after the next proof reload.
+  const hasInstructorComment = !!((instructorText || instructorComment) && (instructorText || instructorComment).trim());
+  const hasStudentComment = !!((studentText || studentComment) && (studentText || studentComment).trim());
   const hasAnyComment = hasInstructorComment || hasStudentComment;
 
   const correctnessDot = commentCorrect === true

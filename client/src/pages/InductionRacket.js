@@ -171,6 +171,7 @@ const InductionRacket = () => {
   const [comments, setComments] = useState({});
   const [activePadIndex, setActivePadIndex] = useState(null);
   const [activeSide, setActiveSide] = useState(null);
+  const [activeCase, setActiveCase] = useState(null);
   const [studentComment, setStudentComment] = useState("");
   const [instructorComment, setInstructorComment] = useState("");
   const [commentStatus, setCommentStatus] = useState({})
@@ -530,6 +531,11 @@ const InductionRacket = () => {
             resultNode: line.resultNode || 0,
             hide_expression: line.hide_expression || false,
             hide_justification: line.hide_justification || false,
+            // Keep comments with the line so the comment modal and the
+            // button color cue work after a proof reload.
+            instructor_comment: line.instructor_comment || '',
+            student_comment: line.student_comment || '',
+            comment_correct: line.comment_correct !== undefined ? line.comment_correct : null,
             deleted: false
           };
         });
@@ -2096,21 +2102,17 @@ const InductionRacket = () => {
           />
         </Col>
         <Col xs="auto" className="d-flex align-items-center">
-          <Button   
-          variant= "secondary" //{hasComments ? "warning" : "secondary"}
-          onClick={async() => {
-            const data = await inductionService.getComments({
-              side: side,
-              line_number: padIndex
-            });
-
+          <Button
+          variant={(field?.instructor_comment || field?.student_comment) ? "warning" : "secondary"}
+          onClick={() => {
+            // Comments ride along on the line data from get-user-proof, so
+            // no extra fetch is needed (the old inductionService.getComments
+            // call pointed at a service function that never existed).
             setActivePadIndex(padIndex);
             setActiveSide(side);
-            setStudentComment(data.student || "");
-            setInstructorComment(data.instructor || "");
-
-            //if either a student or instructor comment exists, make button a dif color
-
+            setActiveCase(caseType);
+            setStudentComment(field?.student_comment || "");
+            setInstructorComment(field?.instructor_comment || "");
             setShowCommentsModal(true);
           }}
           >
@@ -3302,20 +3304,17 @@ const InductionRacket = () => {
         OnInstructorCommentChange={setInstructorComment}
         isStudent={currentUserType?.is_student}
         onSave={async () => {
-          await inductionService.saveComment({
+          // inductionService.saveComment never existed - every save threw a
+          // TypeError. Use the real update-comment endpoint, sending only the
+          // field the current role is allowed to edit.
+          const isStudent = currentUserType?.is_student;
+          await inductionService.updateComment({
+            case: activeCase,
             side: activeSide,
-            line_number: activePadIndex,
-            role: "student",
-            comment: studentComment
+            lineNumber: activePadIndex,
+            proofId: sessionStorage.getItem('induction_current_proof_id') || undefined,
+            ...(isStudent ? { studentComment } : { instructorComment })
           });
-
-          await inductionService.saveComment({
-            side: activeSide,
-            line_number: activePadIndex,
-            role: "instructor",
-            comment: instructorComment
-          });
-          
           setShowCommentsModal(false);
         }}
       />

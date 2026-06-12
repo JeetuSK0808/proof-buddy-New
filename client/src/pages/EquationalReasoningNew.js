@@ -526,7 +526,12 @@ const EquationalReasoningNew = () => {
                  resultNode: line.result_node || line.resultNode || 0,
                  deleted: false,
                  hide_expression: line.hide_expression || false,
-                 hide_justification: line.hide_justification || false
+                 hide_justification: line.hide_justification || false,
+                 // Comments live on the DB lines; without these three fields
+                 // every comment disappeared from the UI on proof reload.
+                 instructor_comment: line.instructor_comment || '',
+                 student_comment: line.student_comment || '',
+                 comment_correct: line.comment_correct !== undefined ? line.comment_correct : null
                };
             });
             
@@ -811,7 +816,7 @@ const EquationalReasoningNew = () => {
       console.error('[loadProofLines] Error loading proof lines:', error);
       // Don't show error to user - this is a background operation
     }
-  }, [setRacketRuleFields, setLeftPremise, setRightPremise, setProofParams]);
+  }, [setRacketRuleFields, setLeftPremise, setRightPremise, setProofParams, formValues.lHSGoal, formValues.rHSGoal]);
 
   // Toggle sides - no database reload needed, state already has both sides
   const handleToggleSide = useCallback(() => {
@@ -884,6 +889,95 @@ const EquationalReasoningNew = () => {
         }));
     }
   };
+
+  const handleSaveProof = async () => {
+    if (!proofStarted) {
+      toast.error('No active proof to save.');
+      return;
+    }
+    try {
+      const normalizeTypeStr = (t) => (t || '').replace(/\s*->\s*/g, ' > ').trim();
+      const buildLinePayload = (field, lineNumber) => ({
+        racket: (field.racket || '').trim(),
+        rule: field.rule || '',
+        lineNumber,
+        selectedNode: field.selectedNode || 0,
+        resultNode: field.resultNode || 0,
+        startPosition: field.startPosition || 0,
+        jsonTree: field.jsonTree || {},
+        errors: field.errors || ''
+      });
+      const isRealLine = (f) => f && !f.deleted && (f.racket || '').trim() !== '';
+      const lhsFields = racketRuleFields.LHS || [];
+      const rhsFields = racketRuleFields.RHS || [];
+
+      // Definitions/generics live in sessionStorage (same source the
+      // start-proof flow uses), not in component state.
+      let definitions = [];
+      let generics = [];
+      try {
+        definitions = (JSON.parse(sessionStorage.getItem('definitions')) || []).filter(d => d.applied && d.expression);
+        generics = (JSON.parse(sessionStorage.getItem('generics')) || []).filter(g => g.enabled);
+      } catch (e) {
+        console.error('Error reading session definitions:', e);
+      }
+
+      // Send the full current proof state: the backend save wipes and
+      // recreates the proof's lines from this payload, so omitting lines
+      // here would delete them (and their comments) from the database.
+      const proofPayload = {
+        name: formValues.proofName || 'Untitled',
+        tag: formValues.proofTag || '',
+        lHSGoal: (formValues.lHSGoal || '').trim(),
+        rHSGoal: (formValues.rHSGoal || '').trim(),
+        leftPremise: isRealLine(lhsFields[0]) ? buildLinePayload(lhsFields[0], 0) : undefined,
+        rightPremise: isRealLine(rhsFields[0]) ? buildLinePayload(rhsFields[0], 0) : undefined,
+        leftRacketsAndRules: lhsFields.slice(1).filter(isRealLine).map((f, i) => buildLinePayload(f, i + 1)),
+        rightRacketsAndRules: rhsFields.slice(1).filter(isRealLine).map((f, i) => buildLinePayload(f, i + 1)),
+        definitions: definitions.map(d => ({
+          label: d.label || d.name || '',
+          type: normalizeTypeStr(d.type),
+          expression: d.expression
+        })),
+        generics: generics.map(g => ({
+          label: g.label || g.name || '',
+          type: normalizeTypeStr(g.type),
+          restrictions: {
+            assumption: g.assumption || g.restrictions?.assumption || 'None',
+            neverNull: g.neverNull || g.restrictions?.neverNull || false
+          }
+        }))
+      };
+      const saveResponse = await equationalService.saveProof(proofPayload);
+      if (saveResponse && saveResponse.proofId) {
+        sessionStorage.setItem('current_proof_id', String(saveResponse.proofId));
+        sessionStorage.setItem('erProofActive', 'true');
+        toast.success('Proof saved!');
+      } else {
+        toast.error('Error saving proof.');
+      }
+    } catch (error) {
+      console.error('Error saving proof:', error);
+      const serverMsg = error?.response?.data?.error || error?.response?.data?.message;
+      toast.error(typeof serverMsg === 'string' ? serverMsg : 'Error saving proof.');
+    }
+  };
+
+  // Ctrl/Cmd+S saves the current proof. The listener reads the latest
+  // handler through a ref so it does not need to re-bind on every render.
+  const saveProofRef = useRef(null);
+  saveProofRef.current = handleSaveProof;
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        if (saveProofRef.current) saveProofRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const handleNewProof = async () => {
     if (!window.confirm('Start a new proof? Your current proof will remain saved in "All Proofs".')) {
@@ -1635,6 +1729,7 @@ const handleGenerateAndCheck = async () => {
               await equationalService.updateComment({
                 side,
                 lineNumber: padIndex,
+                proofId: sessionStorage.getItem('current_proof_id') || undefined,
                 ...(payload.instructorComment !== undefined && { instructorComment: payload.instructorComment }),
                 ...(payload.studentComment !== undefined && { studentComment: payload.studentComment }),
                 ...(payload.commentCorrect !== undefined && { commentCorrect: payload.commentCorrect })
@@ -1947,6 +2042,14 @@ const handleGenerateAndCheck = async () => {
                         style={{ opacity: proofStarted ? 1 : 0.4, cursor: proofStarted ? 'pointer' : 'not-allowed' }}
                       >
                         Check Current Proof
+                      </Dropdown.Item>
+                      <Dropdown.Item
+                        onClick={handleSaveProof}
+                        href="#"
+                        disabled={!proofStarted}
+                        style={{ opacity: proofStarted ? 1 : 0.4, cursor: proofStarted ? 'pointer' : 'not-allowed' }}
+                      >
+                        Save Proof
                       </Dropdown.Item>
                       <Dropdown.Item
                         onClick={handleNewProof}
