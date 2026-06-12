@@ -99,19 +99,39 @@ AUTH_USER_MODEL = 'accounts.Account'
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.getenv('DB_NAME'),
-        'USER': os.getenv('DB_USER'),
-        'PASSWORD': os.getenv('DB_PASSWORD'),
-        'HOST': os.getenv('DB_HOST'),
-        'PORT': os.getenv('DB_PORT'),
-        'TEST': {
-            'NAME': 'test_proofbuddy',  # never the same as the real DB
-        },
+_DB_HOST = os.getenv('DB_HOST')
+if _DB_HOST:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': os.getenv('DB_NAME'),
+            'USER': os.getenv('DB_USER'),
+            'PASSWORD': os.getenv('DB_PASSWORD'),
+            'HOST': _DB_HOST,
+            'PORT': os.getenv('DB_PORT'),
+            'TEST': {
+                'NAME': 'test_proofbuddy',  # never the same as the real DB
+            },
+        }
     }
-}
+else:
+    # Local-dev fallback: use SQLite when no DB_HOST is configured, so the
+    # project runs without a MySQL server. Production/deploy always sets
+    # DB_HOST, so this branch is never taken there. A warning is printed to
+    # make the fallback impossible to miss.
+    import sys
+    print(
+        "WARNING: DB_HOST is not set - falling back to local SQLite "
+        "(db.sqlite3). Set DB_HOST/DB_NAME/DB_USER/DB_PASSWORD/DB_PORT "
+        "in .env to use MySQL.",
+        file=sys.stderr,
+    )
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 CACHES = {
     "default": {
@@ -136,7 +156,14 @@ CORS_ALLOWED_ORIGINS = [
     "https://proofbuddy.net",
     "https://learn.dcollege.net"
 ]
-CSRF_TRUSTED_ORIGINS = [f"{os.getenv('BACKEND_URL')}", "https://proofbuddy.net"]
+# Build CSRF_TRUSTED_ORIGINS defensively: BACKEND_URL may be unset in local
+# dev, and Django 4+ rejects entries without a scheme (check 4_0.E001).
+_BACKEND_URL = os.getenv('BACKEND_URL')
+CSRF_TRUSTED_ORIGINS = [
+    origin
+    for origin in (_BACKEND_URL, "https://proofbuddy.net", "http://localhost:3000")
+    if origin and origin.startswith(("http://", "https://"))
+]
 
 # Password validation
 # https://docs.djangoproject.com/en/5.0/ref/settings/#auth-password-validators
